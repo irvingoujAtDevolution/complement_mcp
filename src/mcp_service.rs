@@ -10,7 +10,7 @@ use rmcp::{
 };
 
 use crate::backend::LocalGitAwareFs;
-use crate::types::{ListFilesArgs, ReadFileArgs, SearchTextArgs};
+use crate::types::{FindFilesArgs, ListFilesArgs, ReadFileArgs, SearchTextArgs};
 
 #[derive(Clone)]
 pub struct FileServer {
@@ -81,6 +81,22 @@ impl FileServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = "Find files or directories by name or path (gitignore aware)")]
+    pub async fn find_files(
+        &self,
+        Parameters(args): Parameters<FindFilesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .find_files(args)
+            .map_err(|e| Self::internal_error("find_files_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -88,7 +104,7 @@ impl ServerHandler for FileServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Fast git-aware file server with tools: search_text, read_file, list_files"
+                "Fast git-aware file server with tools: search_text, read_file, list_files, find_files"
                     .to_string(),
             ),
             protocol_version: ProtocolVersion::V_2024_11_05,

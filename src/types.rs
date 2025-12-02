@@ -23,6 +23,17 @@ pub enum RangeType {
     Lines,
 }
 
+/// Match mode for `find_files` tool.
+///
+/// - `name` (default): match only against the file or directory name.
+/// - `path`: match against the full relative path (e.g. "src/main.rs").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FindMatchMode {
+    Name,
+    Path,
+}
+
 /// Arguments for `search_text`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchTextArgs {
@@ -37,7 +48,11 @@ pub struct SearchTextArgs {
     #[serde(default)]
     pub case_sensitive: Option<bool>,
 
-    /// Optional. Root directory relative to server root (e.g. "src"). Default: ".".
+    /// Optional. Root directory.
+    ///
+    /// - If relative, it is resolved against the server root (e.g. "src").
+    /// - If absolute, it must be inside some git repository and is used as the search base.
+    ///   In this case, result paths are relative to that absolute root when possible.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -94,7 +109,12 @@ pub struct ReadFileArgs {
 /// Arguments for `list_files`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListFilesArgs {
-    /// Optional. Root directory relative to server root. Default: ".".
+    /// Optional. Root directory.
+    ///
+    /// - If relative, it is resolved against the server root. Returned paths are
+    ///   relative to the server root.
+    /// - If absolute, it must be inside some git repository and is used as the
+    ///   listing base. Returned paths are relative to that absolute root when possible.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -163,7 +183,10 @@ pub struct FileChunkResult {
 /// A single entry in `list_files` result.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FileEntry {
-    /// File or directory path relative to server root.
+    /// File or directory path.
+    ///
+    /// - For relative roots, this is relative to the server root.
+    /// - For absolute roots, this is relative to the absolute root when possible.
     pub path: String,
     /// Whether this entry is a directory.
     pub is_dir: bool,
@@ -178,5 +201,70 @@ pub struct FileEntry {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListFilesResult {
     pub entries: Vec<FileEntry>,
+    pub has_more: bool,
+}
+
+/// Arguments for `find_files`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FindFilesArgs {
+    /// Pattern to search for in file/directory names or paths.
+    pub query: String,
+
+    /// Optional. Root directory.
+    ///
+    /// - If relative, it is resolved against the server root.
+    /// - If absolute, it must be inside some git repository and is used as the
+    ///   search base. Returned paths are relative to that absolute root when possible.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Optional. Whether to recurse into subdirectories. Default: true.
+    #[serde(default)]
+    pub recursive: Option<bool>,
+
+    /// Optional. Only include files/directories matching any of these globs.
+    #[serde(default)]
+    pub include_globs: Option<Vec<String>>,
+
+    /// Optional. Exclude any paths matching these globs.
+    #[serde(default)]
+    pub exclude_globs: Option<Vec<String>>,
+
+    /// Optional. Match mode: `\"name\"` (default) or `\"path\"`.
+    #[serde(default)]
+    pub match_mode: Option<FindMatchMode>,
+
+    /// Optional. Case sensitivity for query matching. Default: false.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+
+    /// Optional. Include directories in results. Default: true.
+    #[serde(default)]
+    pub include_dirs: Option<bool>,
+
+    /// Optional. Maximum number of matches to return. Default: 200.
+    #[serde(default)]
+    pub max_results: Option<u32>,
+
+    /// Optional. Number of matching entries to skip before collecting results. Default: 0.
+    #[serde(default)]
+    pub skip: Option<u32>,
+}
+
+/// A single match in `find_files` result.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FindFileMatch {
+    /// File or directory path.
+    ///
+    /// - For relative roots, this is relative to the server root.
+    /// - For absolute roots, this is relative to the absolute root when possible.
+    pub path: String,
+    /// Whether this match is a directory.
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FindFilesResult {
+    pub matches: Vec<FindFileMatch>,
     pub has_more: bool,
 }

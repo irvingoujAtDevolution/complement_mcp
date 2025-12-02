@@ -17,7 +17,7 @@ is the current project directory.
 
 ## 1. list_files Tests
 
-### 1.1 Basic listing from root
+### 1.1 Basic listing from project root (relative)
 
 - Tool: `list_files`
 - Args:
@@ -33,10 +33,11 @@ is the current project directory.
     - `Cargo.toml`
     - `src/backend.rs`
     - `rmcp-sdk/Cargo.toml`
+  - All `path` values are **relative to the server root** (project directory), e.g. `src/backend.rs`.
   - `is_dir` is `false` for files.
   - `has_more` is `true` when more than 50 files exist.
 
-### 1.2 Non-recursive listing
+### 1.2 Non-recursive listing (relative root)
 
 - Tool: `list_files`
 - Args:
@@ -98,7 +99,7 @@ is the current project directory.
   - `entries` contains both files and directories.
   - Directories have `is_dir: true`.
 
-### 1.6 Invalid root path
+### 1.6 Invalid root path (relative)
 
 - Tool: `list_files`
 - Args:
@@ -112,7 +113,21 @@ is the current project directory.
   - Tool call fails with an MCP error.
   - Error message clearly mentions failure to traverse or missing path.
 
-### 1.7 Paging with skip
+### 1.7 Root escaping repository (relative)
+
+- Tool: `list_files`
+- Args:
+  ```json
+  {
+    "root": "../outside",
+    "recursive": true
+  }
+  ```
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message indicates that the root escapes the repository root.
+
+### 1.8 Paging with skip (relative root)
 
 - Tool: `list_files`
 - Step 1 Args:
@@ -136,6 +151,41 @@ is the current project directory.
 - Expectations:
   - Step 1 and Step 2 `entries` contain disjoint slices of the same overall file list.
   - If the project has more than 20 files, both calls may have `has_more: true`.
+
+### 1.9 Absolute root inside a git repository
+
+- Tool: `list_files`
+- Args (example for Windows):
+  ```json
+  {
+    "root": "D:/RDM",
+    "recursive": false,
+    "include_dirs": true,
+    "max_results": 100
+  }
+  ```
+- Preconditions:
+  - `D:/RDM` exists, is a directory, and is inside some git repository (has a `.git` ancestor).
+- Expectations:
+  - Tool call succeeds.
+  - `entries` lists files/directories directly under `D:/RDM`.
+  - Each `path` is **relative to the absolute root** `D:/RDM` (e.g. `subdir/file.txt`), not relative to the server project root.
+
+### 1.10 Absolute root outside any git repository
+
+- Tool: `list_files`
+- Args (example):
+  ```json
+  {
+    "root": "C:/Windows",
+    "recursive": false
+  }
+  ```
+- Preconditions:
+  - `C:/Windows` (or chosen path) is not inside any git repository (no `.git` ancestor).
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message indicates that the root is not inside a git repository.
 
 ---
 
@@ -443,6 +493,28 @@ is the current project directory.
   - Step 2 `hits` start from a later subset of all matches compared to Step 1 (no overlap in `line` for the same `path`).
   - If total matches exceed 10, both calls may have `has_more: true`.
 
+### 3.7 Absolute root inside a git repository
+
+- Tool: `search_text`
+- Args (example for Windows):
+  ```json
+  {
+    "query": "some_symbol_name",
+    "mode": "literal",
+    "case_sensitive": false,
+    "root": "D:/RDM",
+    "include_globs": ["**/*"],
+    "max_results": 10,
+    "context_lines": 1
+  }
+  ```
+- Preconditions:
+  - `D:/RDM` exists, is a directory, and is inside some git repository (has a `.git` ancestor).
+- Expectations:
+  - Tool call succeeds.
+  - `hits` (if any) only come from files under `D:/RDM`.
+  - `path` values in hits are relative to `D:/RDM` when possible (e.g. `subdir/file.txt`).
+
 ---
 
 ## 4. Integration / Sanity Tests
@@ -456,4 +528,146 @@ is the current project directory.
 Expectations:
 - All three tools compose cleanly:
   - Paths from `list_files` are valid inputs to `read_file` and `search_text`.
+
+---
+
+## 5. find_files Tests
+
+### 5.1 Basic name search from project root (relative)
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "backend.rs",
+    "root": ".",
+    "recursive": true,
+    "match_mode": "name",
+    "max_results": 10
+  }
+  ```
+- Expectations:
+  - `matches` contains at least one entry with `path` equal to `src/backend.rs`.
+  - `is_dir` is `false` for that entry.
+
+### 5.2 Path search under a subdirectory (relative)
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "crates/rmcp/src",
+    "root": ".",
+    "recursive": true,
+    "match_mode": "path",
+    "max_results": 50
+  }
+  ```
+- Expectations:
+  - All returned `path` values are relative to the project root.
+  - At least one match is under `rmcp-sdk/crates/rmcp/src`.
+
+### 5.3 Case-insensitive name search
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "CARGO.TOML",
+    "root": ".",
+    "recursive": false,
+    "match_mode": "name",
+    "case_sensitive": false,
+    "max_results": 10
+  }
+  ```
+- Expectations:
+  - At least one match has `path` equal to `Cargo.toml`.
+
+### 5.4 Exclude and include globs
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "Cargo.toml",
+    "root": ".",
+    "recursive": true,
+    "match_mode": "name",
+    "include_globs": ["**/Cargo.toml"],
+    "exclude_globs": ["rmcp-sdk/**"],
+    "max_results": 20
+  }
+  ```
+- Expectations:
+  - All matches have file name `Cargo.toml`.
+  - No match has a `path` starting with `rmcp-sdk/`.
+
+### 5.5 Invalid root (relative)
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "anything",
+    "root": "this/path/does/not/exist",
+    "recursive": true
+  }
+  ```
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message clearly mentions that the root path does not exist or is not a directory.
+
+### 5.6 Root escaping repository (relative)
+
+- Tool: `find_files`
+- Args:
+  ```json
+  {
+    "query": "anything",
+    "root": "../outside",
+    "recursive": true
+  }
+  ```
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message indicates that the root escapes the repository root.
+
+### 5.7 Absolute root inside a git repository
+
+- Tool: `find_files`
+- Args (example for Windows):
+  ```json
+  {
+    "query": ".sln",
+    "root": "D:/RDM",
+    "recursive": false,
+    "match_mode": "name",
+    "include_dirs": false,
+    "max_results": 50
+  }
+  ```
+- Preconditions:
+  - `D:/RDM` exists, is a directory, and is inside some git repository (has a `.git` ancestor).
+- Expectations:
+  - Tool call succeeds.
+  - `matches` contain entries like `Devolutions.Server.sln` (relative to `D:/RDM`).
+  - All `path` values are relative to `D:/RDM` when possible.
+
+### 5.8 Absolute root outside any git repository
+
+- Tool: `find_files`
+- Args (example):
+  ```json
+  {
+    "query": "anything",
+    "root": "C:/Windows",
+    "recursive": false
+  }
+  ```
+- Preconditions:
+  - `C:/Windows` (or chosen path) is not inside any git repository (no `.git` ancestor).
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message indicates that the root is not inside a git repository.
 - No unexpected errors when chaining operations.

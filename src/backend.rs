@@ -9,8 +9,9 @@ use ignore::WalkBuilder;
 use regex::RegexBuilder;
 
 use crate::types::{
-    FileChunkResult, FileEntry, FileRangeInfo, ListFilesArgs, ListFilesResult, RangeType,
-    ReadFileArgs, SearchHit, SearchMode, SearchTextArgs, SearchTextResult,
+    FileChunkResult, FileEntry, FileRangeInfo, FindFileMatch, FindFilesArgs, FindFilesResult,
+    FindMatchMode, ListFilesArgs, ListFilesResult, RangeType, ReadFileArgs, SearchHit,
+    SearchMode, SearchTextArgs, SearchTextResult,
 };
 
 const DEFAULT_MAX_SEARCH_RESULTS: u32 = 200;
@@ -46,13 +47,20 @@ impl LocalGitAwareFs {
     }
 
     fn resolve_path(&self, rel: &str) -> Result<PathBuf> {
-        let joined = self.root.join(rel);
+        let rel_path = Path::new(rel);
+        let is_absolute = rel_path.is_absolute();
+
+        let joined = if is_absolute {
+            rel_path.to_path_buf()
+        } else {
+            self.root.join(rel_path)
+        };
+
         let canonical = joined
             .canonicalize()
             .with_context(|| format!("failed to canonicalize path: {}", joined.display()))?;
 
-        let root = &self.root;
-        if !canonical.starts_with(root) {
+        if !is_absolute && !canonical.starts_with(&self.root) {
             return Err(anyhow!(
                 "path escapes repository root: {}",
                 canonical.display()
@@ -82,14 +90,68 @@ impl LocalGitAwareFs {
         }
     }
 
+    fn find_git_root(start: &Path) -> Option<PathBuf> {
+        let mut current = Some(start.to_path_buf());
+        while let Some(dir) = current {
+            let git_dir = dir.join(".git");
+            if git_dir.exists() {
+                return Some(dir);
+            }
+            current = dir.parent().map(Path::to_path_buf);
+        }
+        None
+    }
+
     pub fn list_files(&self, args: ListFilesArgs) -> Result<ListFilesResult> {
-        let root_rel = args.root.as_deref().unwrap_or(".");
-        let start_path = self.root.join(root_rel);
+        let root_arg = args.root.as_deref().unwrap_or(".");
+        let root_path = Path::new(root_arg);
+        let is_absolute = root_path.is_absolute();
+
+        let start_path = if is_absolute {
+            root_path
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize list_files root: {}", root_arg))?
+        } else {
+            let joined = self.root.join(root_path);
+            let canonical = joined
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize list_files root: {}", joined.display()))?;
+
+            if !canonical.starts_with(&self.root) {
+                return Err(anyhow!(
+                    "list_files root escapes repository root: {}",
+                    canonical.display()
+                ));
+            }
+
+            canonical
+        };
+
         let recursive = args.recursive.unwrap_or(true);
         let include_dirs = args.include_dirs.unwrap_or(false);
         let max_results = args.max_results.unwrap_or(DEFAULT_LIST_MAX_RESULTS);
         let skip = args.skip.unwrap_or(0);
         let include_metadata = args.include_metadata.unwrap_or(false);
+
+        if !start_path.exists() {
+            return Err(anyhow!(
+                "list_files root path does not exist: {}",
+                start_path.display()
+            ));
+        }
+        if !start_path.is_dir() {
+            return Err(anyhow!(
+                "list_files root path is not a directory: {}",
+                start_path.display()
+            ));
+        }
+
+        if is_absolute && Self::find_git_root(&start_path).is_none() {
+            return Err(anyhow!(
+                "list_files root path is not inside a git repository: {}",
+                start_path.display()
+            ));
+        }
 
         let include_globs = Self::build_globset(&args.include_globs)?;
         let exclude_globs = Self::build_globset(&args.exclude_globs)?;
@@ -116,10 +178,9 @@ impl LocalGitAwareFs {
             if path == start_path {
                 continue;
             }
-
-            let rel = match path.strip_prefix(&self.root) {
+            let rel = match path.strip_prefix(&start_path) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(_) => path.strip_prefix(&self.root).unwrap_or(path),
             };
 
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -175,6 +236,162 @@ impl LocalGitAwareFs {
         Ok(ListFilesResult {
             entries,
             has_more: hit_limit,
+        })
+    }
+
+    pub fn find_files(&self, args: FindFilesArgs) -> Result<FindFilesResult> {
+        let root_arg = args.root.as_deref().unwrap_or(".");
+        let root_path = Path::new(root_arg);
+        let is_absolute = root_path.is_absolute();
+
+        let start_path = if is_absolute {
+            root_path
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize find_files root: {}", root_arg))?
+        } else {
+            let joined = self.root.join(root_path);
+            let canonical = joined
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize find_files root: {}", joined.display()))?;
+
+            if !canonical.starts_with(&self.root) {
+                return Err(anyhow!(
+                    "find_files root escapes repository root: {}",
+                    canonical.display()
+                ));
+            }
+
+            canonical
+        };
+
+        let recursive = args.recursive.unwrap_or(true);
+        let include_dirs = args.include_dirs.unwrap_or(true);
+        let max_results = args.max_results.unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
+        let skip = args.skip.unwrap_or(0);
+        let match_mode = args.match_mode.unwrap_or(FindMatchMode::Name);
+        let case_sensitive = args.case_sensitive.unwrap_or(false);
+
+        if !start_path.exists() {
+            return Err(anyhow!(
+                "find_files root path does not exist: {}",
+                start_path.display()
+            ));
+        }
+        if !start_path.is_dir() {
+            return Err(anyhow!(
+                "find_files root path is not a directory: {}",
+                start_path.display()
+            ));
+        }
+
+        if is_absolute && Self::find_git_root(&start_path).is_none() {
+            return Err(anyhow!(
+                "find_files root path is not inside a git repository: {}",
+                start_path.display()
+            ));
+        }
+
+        let include_globs = Self::build_globset(&args.include_globs)?;
+        let exclude_globs = Self::build_globset(&args.exclude_globs)?;
+
+        let mut builder = WalkBuilder::new(&start_path);
+        builder.standard_filters(true);
+        if !recursive {
+            builder.max_depth(Some(1));
+        }
+
+        let mut matches = Vec::new();
+        let mut seen_matches: u32 = 0;
+
+        let query = args.query;
+        let query_lower = if case_sensitive {
+            None
+        } else {
+            Some(query.to_lowercase())
+        };
+
+        for result in builder.build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("find_files: skip entry error: {err}");
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+            if path == start_path {
+                continue;
+            }
+
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir && !include_dirs {
+                continue;
+            }
+
+            let rel = match path.strip_prefix(&start_path) {
+                Ok(r) => r,
+                Err(_) => path.strip_prefix(&self.root).unwrap_or(path),
+            };
+
+            let rel_str = rel.to_string_lossy();
+
+            if let Some(ref excludes) = exclude_globs
+                && excludes.is_match(rel_str.as_ref())
+            {
+                continue;
+            }
+
+            if let Some(ref includes) = include_globs
+                && !includes.is_match(rel_str.as_ref())
+            {
+                continue;
+            }
+
+            // Decide what to match against: name or path.
+            let target = match match_mode {
+                FindMatchMode::Name => match path.file_name().and_then(|n| n.to_str()) {
+                    Some(name) => name,
+                    None => continue,
+                },
+                FindMatchMode::Path => rel_str.as_ref(),
+            };
+
+            let is_match = if case_sensitive {
+                target.contains(&query)
+            } else {
+                let needle = query_lower
+                    .as_ref()
+                    .expect("lowercased query should be available");
+                let hay_lower = target.to_lowercase();
+                hay_lower.contains(needle)
+            };
+
+            if !is_match {
+                continue;
+            }
+
+            seen_matches = seen_matches.saturating_add(1);
+            if seen_matches <= skip {
+                continue;
+            }
+
+            matches.push(FindFileMatch {
+                path: rel_str.into_owned(),
+                is_dir,
+            });
+
+            if matches.len() as u32 >= max_results {
+                return Ok(FindFilesResult {
+                    matches,
+                    has_more: true,
+                });
+            }
+        }
+
+        Ok(FindFilesResult {
+            matches,
+            has_more: false,
         })
     }
 
@@ -314,8 +531,38 @@ impl LocalGitAwareFs {
         let context_lines = args.context_lines.unwrap_or(DEFAULT_SEARCH_CONTEXT_LINES);
         let skip = args.skip.unwrap_or(0);
 
-        let root_rel = args.root.as_deref().unwrap_or(".");
-        let start_path = self.root.join(root_rel);
+        let root_arg = args.root.as_deref().unwrap_or(".");
+        let root_path = Path::new(root_arg);
+        let is_absolute = root_path.is_absolute();
+
+        let start_path = if is_absolute {
+            let canonical = root_path
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize search_text root: {}", root_arg))?;
+
+            if Self::find_git_root(&canonical).is_none() {
+                return Err(anyhow!(
+                    "search_text root path is not inside a git repository: {}",
+                    canonical.display()
+                ));
+            }
+
+            canonical
+        } else {
+            let joined = self.root.join(root_path);
+            let canonical = joined
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize search_text root: {}", joined.display()))?;
+
+            if !canonical.starts_with(&self.root) {
+                return Err(anyhow!(
+                    "search_text root escapes repository root: {}",
+                    canonical.display()
+                ));
+            }
+
+            canonical
+        };
 
         let include_globs = Self::build_globset(&args.include_globs)?;
         let exclude_globs = Self::build_globset(&args.exclude_globs)?;
@@ -352,9 +599,9 @@ impl LocalGitAwareFs {
                 continue;
             }
 
-            let rel = match path.strip_prefix(&self.root) {
+            let rel = match path.strip_prefix(&start_path) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(_) => path.strip_prefix(&self.root).unwrap_or(path),
             };
 
             let rel_str = rel.to_string_lossy();
