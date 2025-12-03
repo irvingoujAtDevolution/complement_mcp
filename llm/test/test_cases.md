@@ -671,3 +671,184 @@ Expectations:
 - Expectations:
   - Tool call fails with an MCP error.
   - Error message indicates that the root is not inside a git repository.
+
+---
+
+## 6. stat Tests
+
+### 6.1 Existing file (relative path)
+
+- Tool: `stat`
+- Args:
+  ```json
+  {
+    "path": "src/backend.rs"
+  }
+  ```
+- Expectations:
+  - `exists` is `true`.
+  - `is_file` is `true`, `is_dir` is `false`.
+  - `path` is `src/backend.rs` (relative to server root).
+  - `size` and `modified` are present and non-zero.
+
+### 6.2 Existing directory (relative path)
+
+- Tool: `stat`
+- Args:
+  ```json
+  {
+    "path": "src"
+  }
+  ```
+- Expectations:
+  - `exists` is `true`.
+  - `is_dir` is `true`, `is_file` is `false`.
+  - `size` is omitted or `null`.
+
+### 6.3 Non-existent path (relative)
+
+- Tool: `stat`
+- Args:
+  ```json
+  {
+    "path": "this/path/does/not/exist"
+  }
+  ```
+- Expectations:
+  - Call succeeds without MCP error.
+  - `exists` is `false`.
+  - `is_file` and `is_dir` are `false`.
+  - `size` and `modified` are omitted.
+
+### 6.4 Absolute file path
+
+- Tool: `stat`
+- Args (example for Windows):
+  ```json
+  {
+    "path": "D:/RDM-Media-Player/Devolutions.MultiMediaPlayer.sln"
+  }
+  ```
+- Preconditions:
+  - The given `.sln` file exists on disk.
+- Expectations:
+  - `exists` is `true`.
+  - `is_file` is `true`.
+  - `path` is an absolute or canonical path to the solution file.
+
+---
+
+## 7. path_info Tests
+
+### 7.1 Current server root
+
+- Tool: `path_info`
+- Args:
+  ```json
+  {
+    "path": "."
+  }
+  ```
+- Expectations:
+  - `input_path` is `"."`.
+  - `resolved_path` points to the project root directory.
+  - `exists` is `true`, `is_dir` is `true`.
+  - `is_absolute` reflects whether `resolved_path` is absolute.
+  - `canonical_path` is present and points to the same directory.
+  - `repo_root` is the same as `canonical_path` (project git root).
+
+### 7.2 Existing absolute directory with git repo
+
+- Tool: `path_info`
+- Args (example for Windows):
+  ```json
+  {
+    "path": "D:/RDM-Media-Player"
+  }
+  ```
+- Preconditions:
+  - `D:/RDM-Media-Player` exists and has a `.git` ancestor.
+- Expectations:
+  - `exists` is `true`, `is_dir` is `true`.
+  - `is_absolute` is `true`.
+  - `canonical_path` is present and matches the canonical form of `D:/RDM-Media-Player`.
+  - `repo_root` is the git repository root containing that directory.
+
+### 7.3 Non-existent absolute path
+
+- Tool: `path_info`
+- Args (example):
+  ```json
+  {
+    "path": "C:/definitely/not/here"
+  }
+  ```
+- Expectations:
+  - `exists` is `false`.
+  - `canonical_path` is `null` / omitted.
+  - `repo_root` is `null` / omitted.
+
+### 7.4 Relative path under server root
+
+- Tool: `path_info`
+- Args:
+  ```json
+  {
+    "path": "src/backend.rs"
+  }
+  ```
+- Expectations:
+  - `resolved_path` is under the project root.
+  - `exists` is `true`, `is_file` is `true`.
+  - `canonical_path` is present and points to the same file location.
+  - `repo_root` matches the project git root.
+
+---
+
+## 8. overwrite_file Tests
+
+### 8.1 Overwrite existing file
+
+- Tool: `overwrite_file`
+- Args:
+  ```json
+  {
+    "path": "src/backend.rs",
+    "content": "// overwritten by test\n"
+  }
+  ```
+- Expectations:
+  - Tool call succeeds.
+  - `path` in the result is `src/backend.rs`.
+  - A subsequent `read_file` on `src/backend.rs` (lines mode) returns content starting with `"// overwritten by test"`.
+
+> Note: in automated tests, this should be done on a temporary copy of `backend.rs`
+> (e.g., copy the file to a temp path, overwrite that temp path, and then delete it).
+
+### 8.2 Non-existent file
+
+- Tool: `overwrite_file`
+- Args:
+  ```json
+  {
+    "path": "this/file/does/not/exist.rs",
+    "content": "hello\n"
+  }
+  ```
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message clearly indicates a metadata/open failure for the target path.
+
+### 8.3 Directory instead of file
+
+- Tool: `overwrite_file`
+- Args:
+  ```json
+  {
+    "path": "src",
+    "content": "hello\n"
+  }
+  ```
+- Expectations:
+  - Tool call fails with an MCP error.
+  - Error message indicates that `overwrite_file` only supports regular files (not directories).

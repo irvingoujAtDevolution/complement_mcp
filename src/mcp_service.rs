@@ -10,7 +10,10 @@ use rmcp::{
 };
 
 use crate::backend::LocalGitAwareFs;
-use crate::types::{FindFilesArgs, ListFilesArgs, ReadFileArgs, SearchTextArgs};
+use crate::types::{
+    CopyPathArgs, CreateFileArgs, DeletePathArgs, FindFilesArgs, ListFilesArgs, MovePathArgs,
+    OverwriteFileArgs, PathInfoArgs, ReadFileArgs, SearchTextArgs, StatArgs,
+};
 
 #[derive(Clone)]
 pub struct FileServer {
@@ -50,6 +53,22 @@ impl FileServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    #[tool(description = "Get basic metadata for a file or directory path")]
+    pub async fn stat(
+        &self,
+        Parameters(args): Parameters<StatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .stat(args)
+            .map_err(|e| Self::internal_error("stat_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
     #[tool(description = "Read a file or a range from it")]
     pub async fn read_file(
         &self,
@@ -59,6 +78,38 @@ impl FileServer {
             .backend
             .read_file(args)
             .map_err(|e| Self::internal_error("read_file_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Create or overwrite a file with optional content")]
+    pub async fn create_file(
+        &self,
+        Parameters(args): Parameters<CreateFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .create_file(args)
+            .map_err(|e| Self::internal_error("create_file_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Overwrite an existing file's entire content")]
+    pub async fn overwrite_file(
+        &self,
+        Parameters(args): Parameters<OverwriteFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .overwrite_file(args)
+            .map_err(|e| Self::internal_error("overwrite_file_failed", e.to_string()))?;
 
         let json = serde_json::to_string(&result)
             .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
@@ -97,6 +148,70 @@ impl FileServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = "Delete a file or directory path")]
+    pub async fn delete_path(
+        &self,
+        Parameters(args): Parameters<DeletePathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .delete_path(args)
+            .map_err(|e| Self::internal_error("delete_path_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Copy a file between two paths")]
+    pub async fn copy_path(
+        &self,
+        Parameters(args): Parameters<CopyPathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .copy_path(args)
+            .map_err(|e| Self::internal_error("copy_path_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Move (rename) a file between two paths")]
+    pub async fn move_path(
+        &self,
+        Parameters(args): Parameters<MovePathArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .move_path(args)
+            .map_err(|e| Self::internal_error("move_path_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Inspect how a path is resolved and its repository info")]
+    pub async fn path_info(
+        &self,
+        Parameters(args): Parameters<PathInfoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .backend
+            .path_info(args)
+            .map_err(|e| Self::internal_error("path_info_failed", e.to_string()))?;
+
+        let json = serde_json::to_string(&result)
+            .map_err(|e| Self::internal_error("serialize_failed", e.to_string()))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -104,7 +219,7 @@ impl ServerHandler for FileServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Fast git-aware file server with tools: search_text, read_file, list_files, find_files"
+                "Fast git-aware file server with tools: search_text, read_file, list_files, find_files, stat, path_info, create_file, overwrite_file, delete_path, copy_path, move_path"
                     .to_string(),
             ),
             protocol_version: ProtocolVersion::V_2024_11_05,

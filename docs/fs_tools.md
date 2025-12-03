@@ -8,6 +8,13 @@ All examples assume the server root is the current project directory.
 - `fs.list_files` — list files/directories (gitignore-aware, with optional metadata).
 - `fs.read_file` — read a file or a range from it (bytes or lines).
 - `fs.search_text` — search text across files (literal/regex, gitignore-aware).
+- `fs.stat` — get basic metadata for a single file or directory.
+- `fs.path_info` — inspect how a path is resolved and which git repo (if any) it belongs to.
+- `fs.create_file` — create or overwrite a file with optional content.
+- `fs.overwrite_file` — overwrite an existing file's entire content.
+- `fs.delete_path` — delete a file or directory path (with optional recursion).
+- `fs.copy_path` — copy a file from one path to another.
+- `fs.move_path` — move (rename) a file from one path to another.
 
 All tool arguments are JSON objects.
 
@@ -284,3 +291,312 @@ Page 2:
 
 This pattern can be repeated with `skip = page_index * page_size` for simple, deterministic paging.
 
+---
+
+## fs.stat
+
+Quickly check whether a single path exists and basic filesystem metadata for it.
+
+### Arguments
+
+- `path: string` — file or directory path.
+  - If relative, it is resolved against the server root.
+  - If absolute, it is used as-is.
+
+### Result
+
+```jsonc
+{
+  "path": "src/backend.rs",
+  "exists": true,
+  "is_file": true,
+  "is_dir": false,
+  "size": 1234,
+  "modified": 1730500000
+}
+```
+
+Notes:
+
+- When the path does **not** exist, `exists` is `false` and `size`/`modified` are omitted.
+- For relative paths, `path` in the result is relative to the server root when possible.
+
+### Usage Examples
+
+**Check if a source file exists:**
+
+```json
+{
+  "path": "src/backend.rs"
+}
+```
+
+**Check an absolute path outside the current project (when allowed):**
+
+```json
+{
+  "path": "D:/RDM-Media-Player/Devolutions.MultiMediaPlayer.sln"
+}
+```
+
+---
+
+## fs.path_info
+
+Inspect how a path is resolved by the server, including whether it exists and which git repository it belongs to.
+
+### Arguments
+
+- `path?: string` — optional path to inspect.
+  - If omitted or empty, `"."` (the server root) is used.
+  - If relative, it is resolved against the server root.
+  - If absolute, it is used as-is.
+
+### Result
+
+```jsonc
+{
+  "input_path": "D:/RDM-Media-Player",
+  "resolved_path": "D:/RDM-Media-Player",
+  "exists": true,
+  "is_file": false,
+  "is_dir": true,
+  "is_absolute": true,
+  "canonical_path": "D:/RDM-Media-Player",
+  "repo_root": "D:/RDM-Media-Player"
+}
+```
+
+### Usage Examples
+
+**Inspect the current server root:**
+
+```json
+{
+  "path": "."
+}
+```
+
+**Inspect an absolute directory and its git repo:**
+
+```json
+{
+  "path": "D:/RDM-Media-Player"
+}
+```
+
+---
+
+## fs.overwrite_file
+
+Replace the entire content of an existing file.
+
+> This tool requires the target path to already exist and be a regular file.
+
+### Arguments
+
+- `path: string` — file path to overwrite.
+  - If relative, it is resolved against the server root.
+  - If absolute, it is used as-is but must be inside some git repository.
+- `content: string` — new content for the file. The previous content is fully replaced.
+
+### Result
+
+```jsonc
+{
+  "path": "src/backend.rs"
+}
+```
+
+### Usage Examples
+
+**Overwrite a config file with new JSON:**
+
+```json
+{
+  "path": "config/local.json",
+  "content": "{ \"debug\": false }\n"
+}
+```
+
+**Format or normalize a source file after edits:**
+
+```json
+{
+  "path": "src/backend.rs",
+  "content": "<full formatted Rust source here>"
+}
+```
+
+---
+
+## fs.create_file
+
+Create a new file or overwrite an existing one, optionally writing initial content.
+
+### Arguments
+
+- `path: string` — file path to create.
+  - If relative, it is resolved against the server root.
+  - If absolute, it is used as-is but must be inside some git repository.
+- `content?: string` — optional initial content. Default: empty file.
+- `overwrite?: boolean` — overwrite existing file when `true`. Default: `false`.
+- `create_parents?: boolean` — create missing parent directories when `true`. Default: `false`.
+
+### Result
+
+```jsonc
+{
+  "path": "src/new_file.rs",
+  "created": true,
+  "overwritten": false
+}
+```
+
+### Usage Examples
+
+**Create a new file under `src/`:**
+
+```json
+{
+  "path": "src/new_file.rs",
+  "content": "fn main() {}\n",
+  "overwrite": false,
+  "create_parents": true
+}
+```
+
+**Overwrite an existing config file:**
+
+```json
+{
+  "path": "config/local.json",
+  "content": "{ \"debug\": true }\n",
+  "overwrite": true
+}
+```
+
+---
+
+## fs.delete_path
+
+Delete a file or directory path.
+
+### Arguments
+
+- `path: string` — file or directory path to delete.
+  - If relative, it is resolved against the server root.
+  - If absolute, it is used as-is but must be inside some git repository.
+- `recursive?: boolean` — allow recursive delete for directories. Default: `false`.
+- `force?: boolean` — treat non-existent path as success when `true`. Default: `false`.
+
+### Result
+
+```jsonc
+{
+  "path": "src/old_file.rs",
+  "existed": true,
+  "is_dir": false,
+  "removed": true,
+  "recursive": false
+}
+```
+
+### Usage Examples
+
+**Delete a single file:**
+
+```json
+{
+  "path": "src/old_file.rs"
+}
+```
+
+**Recursively delete a directory:**
+
+```json
+{
+  "path": "target/tmp",
+  "recursive": true
+}
+```
+
+---
+
+## fs.copy_path
+
+Copy a file from one path to another.
+
+> Note: currently only regular files are supported as the source.
+
+### Arguments
+
+- `from: string` — source file path.
+- `to: string` — destination file path.
+- `overwrite?: boolean` — overwrite destination if it exists. Default: `false`.
+- `recursive?: boolean` — reserved for future directory support (currently ignored).
+- `create_parents?: boolean` — create missing parent directories for destination. Default: `true`.
+
+### Result
+
+```jsonc
+{
+  "from": "src/backend.rs",
+  "to": "backup/backend.rs",
+  "bytes_copied": 4096,
+  "overwritten": false
+}
+```
+
+### Usage Examples
+
+**Backup a source file:**
+
+```json
+{
+  "from": "src/backend.rs",
+  "to": "backup/backend.rs",
+  "overwrite": true,
+  "create_parents": true
+}
+```
+
+---
+
+## fs.move_path
+
+Move (rename) a file from one path to another.
+
+> Note: currently only regular files are supported as the source.
+
+### Arguments
+
+- `from: string` — source file path.
+- `to: string` — destination file path.
+- `overwrite?: boolean` — overwrite destination if it exists. Default: `false`.
+- `recursive?: boolean` — reserved for future directory support (currently ignored).
+- `create_parents?: boolean` — create missing parent directories for destination. Default: `true`.
+
+### Result
+
+```jsonc
+{
+  "from": "src/tmp.rs",
+  "to": "src/main.rs",
+  "existed": true,
+  "overwritten": true,
+  "recursive": false
+}
+```
+
+### Usage Examples
+
+**Rename a file in place:**
+
+```json
+{
+  "from": "src/tmp.rs",
+  "to": "src/main.rs",
+  "overwrite": true
+}
+```

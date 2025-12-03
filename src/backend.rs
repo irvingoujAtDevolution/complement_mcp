@@ -1,5 +1,5 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,9 +12,11 @@ use regex::bytes::RegexBuilder as ByteRegexBuilder;
 
 use crate::error::{FsError, Result};
 use crate::types::{
-    FileChunkResult, FileEntry, FileRangeInfo, FindFileMatch, FindFilesArgs, FindFilesResult,
-    FindMatchMode, ListFilesArgs, ListFilesResult, RangeType, ReadFileArgs, SearchHit, SearchMode,
-    SearchTextArgs, SearchTextResult,
+    CopyPathArgs, CopyPathResult, CreateFileArgs, CreateFileResult, DeletePathArgs,
+    DeletePathResult, FileChunkResult, FileEntry, FileRangeInfo, FindFileMatch, FindFilesArgs,
+    FindFilesResult, FindMatchMode, ListFilesArgs, ListFilesResult, MovePathArgs, MovePathResult,
+    OverwriteFileArgs, OverwriteFileResult, PathInfoArgs, PathInfoResult, RangeType, ReadFileArgs,
+    SearchHit, SearchMode, SearchTextArgs, SearchTextResult, StatArgs, StatResult,
 };
 
 const DEFAULT_MAX_SEARCH_RESULTS: u32 = 200;
@@ -458,6 +460,651 @@ impl LocalGitAwareFs {
             matches: sliced,
             has_more,
         })
+    }
+
+    pub fn stat(&self, args: StatArgs) -> Result<StatResult> {
+        let raw_path = args.path;
+        let path = Path::new(&raw_path);
+        let is_absolute = path.is_absolute();
+
+        let resolved = if is_absolute {
+            PathBuf::from(&raw_path)
+        } else {
+            self.root.join(path)
+        };
+
+        match std::fs::metadata(&resolved) {
+            Ok(meta) => {
+                // Only enforce repo-root containment for relative paths.
+                let canonical =
+                    resolved
+                        .canonicalize()
+                        .map_err(|source| FsError::CanonicalizePath {
+                            path: resolved.clone(),
+                            source,
+                        })?;
+
+                if !is_absolute && !canonical.starts_with(&self.root) {
+                    return Err(FsError::PathEscapesRepo { path: canonical });
+                }
+
+                let size = if meta.is_file() {
+                    Some(meta.len())
+                } else {
+                    None
+                };
+                let modified = meta.modified().ok().and_then(|time| {
+                    time.duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|dur| dur.as_secs())
+                });
+
+                let display_path = self
+                    .strip_root(&canonical)
+                    .unwrap_or_else(|| canonical.display().to_string());
+
+                Ok(StatResult {
+                    path: display_path,
+                    exists: true,
+                    is_file: meta.is_file(),
+                    is_dir: meta.is_dir(),
+                    size,
+                    modified,
+                })
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Path does not exist: return a structured, non-error result.
+                let display_path = if is_absolute {
+                    resolved.display().to_string()
+                } else {
+                    resolved
+                        .strip_prefix(&self.root)
+                        .unwrap_or(&resolved)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+
+                Ok(StatResult {
+                    path: display_path,
+                    exists: false,
+                    is_file: false,
+                    is_dir: false,
+                    size: None,
+                    modified: None,
+                })
+            }
+            Err(source) => Err(FsError::FileMetadata {
+                path: resolved,
+                source,
+            }),
+        }
+    }
+
+    pub fn path_info(&self, args: PathInfoArgs) -> Result<PathInfoResult> {
+        let input = args.path.unwrap_or_else(|| ".".to_string());
+        let input_path = if input.is_empty() {
+            ".".to_string()
+        } else {
+            input
+        };
+
+        let p = Path::new(&input_path);
+        let is_absolute = p.is_absolute();
+
+        let resolved = if is_absolute {
+            PathBuf::from(&input_path)
+        } else {
+            self.root.join(p)
+        };
+
+        let resolved_str = resolved.display().to_string();
+
+        match std::fs::metadata(&resolved) {
+            Ok(meta) => {
+                let canonical =
+                    resolved
+                        .canonicalize()
+                        .map_err(|source| FsError::CanonicalizePath {
+                            path: resolved.clone(),
+                            source,
+                        })?;
+
+                let canonical_str = canonical.display().to_string();
+                let repo_root = Self::find_git_root(&canonical).map(|p| p.display().to_string());
+
+                Ok(PathInfoResult {
+                    input_path,
+                    resolved_path: resolved_str,
+                    exists: true,
+                    is_file: meta.is_file(),
+                    is_dir: meta.is_dir(),
+                    is_absolute,
+                    canonical_path: Some(canonical_str),
+                    repo_root,
+                })
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(PathInfoResult {
+                input_path,
+                resolved_path: resolved_str,
+                exists: false,
+                is_file: false,
+                is_dir: false,
+                is_absolute,
+                canonical_path: None,
+                repo_root: None,
+            }),
+            Err(source) => Err(FsError::FileMetadata {
+                path: resolved,
+                source,
+            }),
+        }
+    }
+
+    pub fn create_file(&self, args: CreateFileArgs) -> Result<CreateFileResult> {
+        let overwrite = args.overwrite.unwrap_or(false);
+        let create_parents = args.create_parents.unwrap_or(false);
+
+        let raw_path = args.path;
+        let path = Path::new(&raw_path);
+        let is_absolute = path.is_absolute();
+
+        let resolved = if is_absolute {
+            PathBuf::from(&raw_path)
+        } else {
+            self.root.join(path)
+        };
+
+        // Create parent directories if requested.
+        if create_parents
+            && let Some(parent) = resolved.parent()
+            && let Err(source) = std::fs::create_dir_all(parent)
+        {
+            return Err(FsError::CreateParents {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
+
+        // Perform safety checks based on the parent directory.
+        if let Some(parent) = resolved.parent() {
+            let canonical_parent =
+                parent
+                    .canonicalize()
+                    .map_err(|source| FsError::CanonicalizePath {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+
+            if !is_absolute {
+                if !canonical_parent.starts_with(&self.root) {
+                    return Err(FsError::PathEscapesRepo {
+                        path: canonical_parent,
+                    });
+                }
+            } else if Self::find_git_root(&canonical_parent).is_none() {
+                return Err(FsError::WritePathNotInGit {
+                    path: canonical_parent,
+                });
+            }
+        }
+
+        // Check existing target.
+        let existed_meta = std::fs::metadata(&resolved).ok();
+        if let Some(meta) = &existed_meta {
+            if meta.is_dir() {
+                return Err(FsError::DestinationExists {
+                    path: resolved.clone(),
+                });
+            }
+            if !overwrite {
+                return Err(FsError::DestinationExists {
+                    path: resolved.clone(),
+                });
+            }
+        }
+
+        // Open and write content.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&resolved)
+            .map_err(|source| FsError::OpenFile {
+                path: resolved.clone(),
+                source,
+            })?;
+
+        if let Some(content) = args.content {
+            use std::io::Write;
+            file.write_all(content.as_bytes())
+                .map_err(|source| FsError::WriteFile {
+                    path: resolved.clone(),
+                    source,
+                })?;
+        }
+
+        let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+
+        let display_path = self
+            .strip_root(&canonical)
+            .unwrap_or_else(|| canonical.display().to_string());
+
+        Ok(CreateFileResult {
+            path: display_path,
+            created: existed_meta.is_none(),
+            overwritten: existed_meta.is_some(),
+        })
+    }
+
+    pub fn delete_path(&self, args: DeletePathArgs) -> Result<DeletePathResult> {
+        let recursive = args.recursive.unwrap_or(false);
+        let force = args.force.unwrap_or(false);
+
+        let raw_path = args.path;
+        let path = Path::new(&raw_path);
+        let is_absolute = path.is_absolute();
+
+        let resolved = if is_absolute {
+            PathBuf::from(&raw_path)
+        } else {
+            self.root.join(path)
+        };
+
+        match std::fs::metadata(&resolved) {
+            Ok(meta) => {
+                let canonical =
+                    resolved
+                        .canonicalize()
+                        .map_err(|source| FsError::CanonicalizePath {
+                            path: resolved.clone(),
+                            source,
+                        })?;
+
+                if !is_absolute && !canonical.starts_with(&self.root) {
+                    return Err(FsError::PathEscapesRepo { path: canonical });
+                }
+                if is_absolute && Self::find_git_root(&canonical).is_none() {
+                    return Err(FsError::WritePathNotInGit { path: canonical });
+                }
+
+                let is_dir = meta.is_dir();
+                if is_dir {
+                    if !recursive {
+                        return Err(FsError::DeleteDirNonRecursive { path: canonical });
+                    }
+                    std::fs::remove_dir_all(&canonical).map_err(|source| FsError::DeletePath {
+                        path: canonical.clone(),
+                        source,
+                    })?;
+                } else {
+                    std::fs::remove_file(&canonical).map_err(|source| FsError::DeletePath {
+                        path: canonical.clone(),
+                        source,
+                    })?;
+                }
+
+                let display_path = self
+                    .strip_root(&canonical)
+                    .unwrap_or_else(|| canonical.display().to_string());
+
+                Ok(DeletePathResult {
+                    path: display_path,
+                    existed: true,
+                    is_dir,
+                    removed: true,
+                    recursive: is_dir && recursive,
+                })
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if !force {
+                    return Err(FsError::FileMetadata {
+                        path: resolved.clone(),
+                        source: err,
+                    });
+                }
+
+                let display_path = if is_absolute {
+                    resolved.display().to_string()
+                } else {
+                    resolved
+                        .strip_prefix(&self.root)
+                        .unwrap_or(&resolved)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+
+                Ok(DeletePathResult {
+                    path: display_path,
+                    existed: false,
+                    is_dir: false,
+                    removed: false,
+                    recursive: false,
+                })
+            }
+            Err(source) => Err(FsError::FileMetadata {
+                path: resolved,
+                source,
+            }),
+        }
+    }
+
+    pub fn copy_path(&self, args: CopyPathArgs) -> Result<CopyPathResult> {
+        let overwrite = args.overwrite.unwrap_or(false);
+        let create_parents = args.create_parents.unwrap_or(true);
+
+        let from_raw = args.from;
+        let to_raw = args.to;
+
+        let from_path = Path::new(&from_raw);
+        let to_path = Path::new(&to_raw);
+
+        let from_abs = from_path.is_absolute();
+        let to_abs = to_path.is_absolute();
+
+        let from_resolved = if from_abs {
+            PathBuf::from(&from_raw)
+        } else {
+            self.root.join(from_path)
+        };
+        let to_resolved = if to_abs {
+            PathBuf::from(&to_raw)
+        } else {
+            self.root.join(to_path)
+        };
+
+        let from_meta =
+            std::fs::metadata(&from_resolved).map_err(|source| FsError::FileMetadata {
+                path: from_resolved.clone(),
+                source,
+            })?;
+
+        if !from_meta.is_file() {
+            return Err(FsError::CopyPath {
+                from: from_resolved,
+                to: to_resolved,
+                source: io::Error::other("copy_path currently only supports regular files"),
+            });
+        }
+
+        // Security: both ends must be inside some git repo, and in the same repo.
+        let from_canonical =
+            from_resolved
+                .canonicalize()
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: from_resolved.clone(),
+                    source,
+                })?;
+
+        let from_repo_root =
+            Self::find_git_root(&from_canonical).ok_or_else(|| FsError::WritePathNotInGit {
+                path: from_canonical.clone(),
+            })?;
+
+        // Ensure destination parent exists if requested.
+        if create_parents
+            && let Some(parent) = to_resolved.parent()
+            && let Err(source) = std::fs::create_dir_all(parent)
+        {
+            return Err(FsError::CreateParents {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
+
+        let to_parent = to_resolved
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let to_parent_canonical =
+            to_parent
+                .canonicalize()
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: to_parent.clone(),
+                    source,
+                })?;
+
+        let to_repo_root = Self::find_git_root(&to_parent_canonical).ok_or_else(|| {
+            FsError::WritePathNotInGit {
+                path: to_parent_canonical.clone(),
+            }
+        })?;
+
+        if from_repo_root != to_repo_root {
+            return Err(FsError::CopyAcrossRepos {
+                from: from_canonical,
+                to: to_resolved.clone(),
+            });
+        }
+
+        // Overwrite handling.
+        let existing_to = std::fs::metadata(&to_resolved).ok();
+        if existing_to.is_some() && !overwrite {
+            return Err(FsError::DestinationExists {
+                path: to_resolved.clone(),
+            });
+        }
+
+        let bytes_copied =
+            std::fs::copy(&from_resolved, &to_resolved).map_err(|source| FsError::CopyPath {
+                from: from_resolved.clone(),
+                to: to_resolved.clone(),
+                source,
+            })?;
+
+        let from_display = self
+            .strip_root(&from_canonical)
+            .unwrap_or_else(|| from_canonical.display().to_string());
+        let to_display = self
+            .strip_root(&to_resolved)
+            .unwrap_or_else(|| to_resolved.display().to_string());
+
+        Ok(CopyPathResult {
+            from: from_display,
+            to: to_display,
+            bytes_copied: Some(bytes_copied),
+            overwritten: existing_to.is_some(),
+        })
+    }
+
+    pub fn move_path(&self, args: MovePathArgs) -> Result<MovePathResult> {
+        let overwrite = args.overwrite.unwrap_or(false);
+        let create_parents = args.create_parents.unwrap_or(true);
+
+        let from_raw = args.from;
+        let to_raw = args.to;
+
+        let from_path = Path::new(&from_raw);
+        let to_path = Path::new(&to_raw);
+
+        let from_abs = from_path.is_absolute();
+        let to_abs = to_path.is_absolute();
+
+        let from_resolved = if from_abs {
+            PathBuf::from(&from_raw)
+        } else {
+            self.root.join(from_path)
+        };
+        let to_resolved = if to_abs {
+            PathBuf::from(&to_raw)
+        } else {
+            self.root.join(to_path)
+        };
+
+        let from_meta = match std::fs::metadata(&from_resolved) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let from_display = from_resolved.display().to_string();
+                return Ok(MovePathResult {
+                    from: from_display,
+                    to: to_resolved.display().to_string(),
+                    existed: false,
+                    overwritten: false,
+                    recursive: false,
+                });
+            }
+            Err(source) => {
+                return Err(FsError::FileMetadata {
+                    path: from_resolved.clone(),
+                    source,
+                });
+            }
+        };
+
+        if !from_meta.is_file() {
+            return Err(FsError::MovePath {
+                from: from_resolved,
+                to: to_resolved,
+                source: io::Error::other("move_path currently only supports regular files"),
+            });
+        }
+
+        // Security: both ends must be inside some git repo, and in the same repo.
+        let from_canonical =
+            from_resolved
+                .canonicalize()
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: from_resolved.clone(),
+                    source,
+                })?;
+
+        let from_repo_root =
+            Self::find_git_root(&from_canonical).ok_or_else(|| FsError::WritePathNotInGit {
+                path: from_canonical.clone(),
+            })?;
+
+        if create_parents
+            && let Some(parent) = to_resolved.parent()
+            && let Err(source) = std::fs::create_dir_all(parent)
+        {
+            return Err(FsError::CreateParents {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
+
+        let to_parent = to_resolved
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let to_parent_canonical =
+            to_parent
+                .canonicalize()
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: to_parent.clone(),
+                    source,
+                })?;
+
+        let to_repo_root = Self::find_git_root(&to_parent_canonical).ok_or_else(|| {
+            FsError::WritePathNotInGit {
+                path: to_parent_canonical.clone(),
+            }
+        })?;
+
+        if from_repo_root != to_repo_root {
+            return Err(FsError::MoveAcrossRepos {
+                from: from_canonical,
+                to: to_resolved.clone(),
+            });
+        }
+
+        let existing_to = std::fs::metadata(&to_resolved).ok();
+        if existing_to.is_some() && !overwrite {
+            return Err(FsError::DestinationExists {
+                path: to_resolved.clone(),
+            });
+        }
+
+        std::fs::rename(&from_resolved, &to_resolved).map_err(|source| FsError::MovePath {
+            from: from_resolved.clone(),
+            to: to_resolved.clone(),
+            source,
+        })?;
+
+        let from_display = self
+            .strip_root(&from_canonical)
+            .unwrap_or_else(|| from_canonical.display().to_string());
+        let to_display = self
+            .strip_root(&to_resolved)
+            .unwrap_or_else(|| to_resolved.display().to_string());
+
+        Ok(MovePathResult {
+            from: from_display,
+            to: to_display,
+            existed: true,
+            overwritten: existing_to.is_some(),
+            recursive: false,
+        })
+    }
+
+    pub fn overwrite_file(&self, args: OverwriteFileArgs) -> Result<OverwriteFileResult> {
+        let raw_path = args.path;
+        let path = Path::new(&raw_path);
+        let is_absolute = path.is_absolute();
+
+        let resolved = if is_absolute {
+            PathBuf::from(&raw_path)
+        } else {
+            self.root.join(path)
+        };
+
+        let meta = std::fs::metadata(&resolved).map_err(|source| FsError::FileMetadata {
+            path: resolved.clone(),
+            source,
+        })?;
+
+        if !meta.is_file() {
+            return Err(FsError::WriteFile {
+                path: resolved,
+                source: io::Error::other("overwrite_file only supports regular files"),
+            });
+        }
+
+        // Safety: similar to create_file, but require an existing file.
+        if let Some(parent) = resolved.parent() {
+            let canonical_parent =
+                parent
+                    .canonicalize()
+                    .map_err(|source| FsError::CanonicalizePath {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+
+            if !is_absolute && !canonical_parent.starts_with(&self.root) {
+                return Err(FsError::PathEscapesRepo {
+                    path: canonical_parent,
+                });
+            }
+
+            if is_absolute && Self::find_git_root(&canonical_parent).is_none() {
+                return Err(FsError::WritePathNotInGit {
+                    path: canonical_parent,
+                });
+            }
+        }
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&resolved)
+            .map_err(|source| FsError::OpenFile {
+                path: resolved.clone(),
+                source,
+            })?;
+
+        use std::io::Write;
+        file.write_all(args.content.as_bytes())
+            .map_err(|source| FsError::WriteFile {
+                path: resolved.clone(),
+                source,
+            })?;
+
+        let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+
+        let display_path = self
+            .strip_root(&canonical)
+            .unwrap_or_else(|| canonical.display().to_string());
+
+        Ok(OverwriteFileResult { path: display_path })
     }
 
     pub fn read_file(&self, args: ReadFileArgs) -> Result<FileChunkResult> {
