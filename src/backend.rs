@@ -2,11 +2,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use regex::RegexBuilder;
+use memmap2::Mmap;
+use regex::bytes::RegexBuilder as ByteRegexBuilder;
 
 use crate::types::{
     FileChunkResult, FileEntry, FileRangeInfo, FindFileMatch, FindFilesArgs, FindFilesResult,
@@ -552,7 +555,12 @@ impl LocalGitAwareFs {
             let joined = self.root.join(root_path);
             let canonical = joined
                 .canonicalize()
-                .with_context(|| format!("failed to canonicalize search_text root: {}", joined.display()))?;
+                .with_context(|| {
+                    format!(
+                        "failed to canonicalize search_text root: {}",
+                        joined.display()
+                    )
+                })?;
 
             if !canonical.starts_with(&self.root) {
                 return Err(anyhow!(
@@ -564,161 +572,240 @@ impl LocalGitAwareFs {
             canonical
         };
 
-        let include_globs = Self::build_globset(&args.include_globs)?;
-        let exclude_globs = Self::build_globset(&args.exclude_globs)?;
+        let include_globs = Self::build_globset(&args.include_globs)?
+            .map(Arc::new);
+        let exclude_globs = Self::build_globset(&args.exclude_globs)?
+            .map(Arc::new);
 
+        // Build a bytes-based regex matcher. Literal mode is implemented
+        // by escaping the query string.
+        let pattern_str = match mode {
+            SearchMode::Literal => regex::escape(&args.query),
+            SearchMode::Regex => args.query.clone(),
+        };
+
+        let matcher = ByteRegexBuilder::new(&pattern_str)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .with_context(|| format!("invalid regex: {}", args.query))?;
+
+        let matcher = Arc::new(matcher);
+        let hits: Arc<Mutex<Vec<SearchHit>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        // Global counters across all threads: how many matches have been
+        // seen (for `skip`) and whether we hit the `max_results` cap.
+        let seen_matches = Arc::new(AtomicU32::new(0));
+        let hit_limit = Arc::new(AtomicBool::new(false));
+
+        let repo_root = self.root.clone();
         let mut builder = WalkBuilder::new(&start_path);
         builder.standard_filters(true);
 
-        let mut hits = Vec::new();
-        let mut matched: u32 = 0;
+        builder.build_parallel().run(|| {
+            let matcher = matcher.clone();
+            let hits = hits.clone();
+            let seen_matches = seen_matches.clone();
+            let hit_limit = hit_limit.clone();
+            let include_globs = include_globs.clone();
+            let exclude_globs = exclude_globs.clone();
+            let start_path = start_path.clone();
+            let repo_root = repo_root.clone();
 
-        let pattern = match mode {
-            SearchMode::Literal => None,
-            SearchMode::Regex => {
-                let mut builder = RegexBuilder::new(&args.query);
-                builder.case_insensitive(!case_sensitive);
-                let pat = builder
-                    .build()
-                    .with_context(|| format!("invalid regex: {}", args.query))?;
-                Some(pat)
-            }
-        };
-
-        for result in builder.build() {
-            let entry = match result {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("search_text: skip entry error: {err}");
-                    continue;
+            Box::new(move |entry_res| {
+                if hit_limit.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
                 }
-            };
 
-            let path = entry.path();
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(err) => {
+                        eprintln!("search_text: skip entry error: {err}");
+                        return ignore::WalkState::Continue;
+                    }
+                };
 
-            let rel = match path.strip_prefix(&start_path) {
-                Ok(r) => r,
-                Err(_) => path.strip_prefix(&self.root).unwrap_or(path),
-            };
-
-            let rel_str = rel.to_string_lossy();
-
-            if let Some(ref excludes) = exclude_globs
-                && excludes.is_match(rel_str.as_ref())
-            {
-                continue;
-            }
-
-            if let Some(ref includes) = include_globs
-                && !includes.is_match(rel_str.as_ref())
-            {
-                continue;
-            }
-
-            let file = match File::open(path) {
-                Ok(f) => f,
-                Err(err) => {
-                    eprintln!(
-                        "search_text: skip file open error {}: {err}",
-                        path.display()
-                    );
-                    continue;
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    return ignore::WalkState::Continue;
                 }
-            };
-            let reader = BufReader::new(file);
 
-            let mut lines: Vec<String> = Vec::new();
-            for line_res in reader.lines() {
-                match line_res {
-                    Ok(line) => lines.push(line),
+                let rel = match path.strip_prefix(&start_path) {
+                    Ok(r) => r,
+                    Err(_) => path.strip_prefix(&repo_root).unwrap_or(path),
+                };
+
+                let rel_str = rel.to_string_lossy();
+
+                if let Some(ref excludes) = exclude_globs
+                    && excludes.is_match(rel_str.as_ref())
+                {
+                    return ignore::WalkState::Continue;
+                }
+
+                if let Some(ref includes) = include_globs
+                    && !includes.is_match(rel_str.as_ref())
+                {
+                    return ignore::WalkState::Continue;
+                }
+
+                let file = match File::open(path) {
+                    Ok(f) => f,
                     Err(err) => {
                         eprintln!(
-                            "search_text: skip file read error {}: {err}",
+                            "search_text: skip file open error {}: {err}",
                             path.display()
                         );
-                        lines.clear();
-                        break;
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                let mmap = match unsafe { Mmap::map(&file) } {
+                    Ok(m) => m,
+                    Err(err) => {
+                        eprintln!(
+                            "search_text: skip mmap error {}: {err}",
+                            path.display()
+                        );
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                if mmap.is_empty() {
+                    return ignore::WalkState::Continue;
+                }
+
+                // Precompute line start offsets (0-based byte indices).
+                let mut line_starts: Vec<usize> = Vec::new();
+                line_starts.push(0);
+                for (i, &b) in mmap.iter().enumerate() {
+                    if b == b'\n' && i + 1 < mmap.len() {
+                        line_starts.push(i + 1);
                     }
                 }
-            }
-            if lines.is_empty() {
-                continue;
-            }
 
-            for (idx, line) in lines.iter().enumerate() {
-                let match_start: Option<usize> = match mode {
-                    SearchMode::Regex => {
-                        let re = pattern
-                            .as_ref()
-                            .expect("regex mode requires compiled pattern");
-                        re.find(line).map(|m| m.start())
+                let line_count = line_starts.len();
+
+                for (idx, &line_start) in line_starts.iter().enumerate() {
+                    if hit_limit.load(Ordering::Relaxed) {
+                        return ignore::WalkState::Quit;
                     }
-                    SearchMode::Literal => {
-                        if case_sensitive {
-                            line.find(&args.query)
+
+                    let line_end = if idx + 1 < line_count {
+                        line_starts[idx + 1].saturating_sub(1)
+                    } else {
+                        mmap.len()
+                    };
+
+                    if line_start >= line_end || line_end > mmap.len() {
+                        continue;
+                    }
+
+                    let line_slice = &mmap[line_start..line_end];
+
+                    // Find the first match in this line (keep behavior
+                    // of at most one hit per line).
+                    let mat = match matcher.find(line_slice) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+
+                    let col_idx = mat.start();
+
+                    let seen_before =
+                        seen_matches.fetch_add(1, Ordering::Relaxed);
+                    let seen_after = seen_before + 1;
+
+                    if seen_after <= skip {
+                        continue;
+                    }
+
+                    // Check and push into the shared hits vector.
+                    let mut guard = hits
+                        .lock()
+                        .expect("search_text: hits mutex poisoned");
+                    if guard.len() as u32 >= max_results {
+                        hit_limit.store(true, Ordering::Relaxed);
+                        return ignore::WalkState::Quit;
+                    }
+
+                    let line_num = idx as u64 + 1;
+                    let col = col_idx as u64;
+
+                    let start_ctx =
+                        idx.saturating_sub(context_lines as usize);
+                    let end_ctx = usize::min(
+                        line_count,
+                        idx + 1 + context_lines as usize,
+                    );
+
+                    let mut context_before = Vec::new();
+                    let mut context_after = Vec::new();
+
+                    for ctx_idx in start_ctx..end_ctx {
+                        if ctx_idx == idx {
+                            continue;
+                        }
+
+                        let ctx_start = line_starts[ctx_idx];
+                        let ctx_end = if ctx_idx + 1 < line_count {
+                            line_starts[ctx_idx + 1].saturating_sub(1)
                         } else {
-                            let line_lower = line.to_lowercase();
-                            let query_lower = args.query.to_lowercase();
-                            line_lower.find(&query_lower)
+                            mmap.len()
+                        };
+
+                        if ctx_start >= ctx_end || ctx_end > mmap.len() {
+                            continue;
+                        }
+
+                        let ctx_slice = &mmap[ctx_start..ctx_end];
+                        let ctx_text =
+                            String::from_utf8_lossy(ctx_slice).to_string();
+
+                        if ctx_idx < idx {
+                            context_before.push(ctx_text);
+                        } else {
+                            context_after.push(ctx_text);
                         }
                     }
-                };
 
-                let Some(col_idx) = match_start else {
-                    continue;
-                };
+                    let rel = match path.strip_prefix(&repo_root) {
+                        Ok(r) => r.to_string_lossy().into_owned(),
+                        Err(_) => path.display().to_string(),
+                    };
 
-                matched = matched.saturating_add(1);
-                if matched <= skip {
-                    continue;
-                }
+                    let line_text =
+                        String::from_utf8_lossy(line_slice).to_string();
 
-                let line_num = idx as u64 + 1;
-                let col = col_idx as u64;
-                let start = idx.saturating_sub(context_lines as usize);
-                let end = usize::min(lines.len(), idx + 1 + context_lines as usize);
+                    guard.push(SearchHit {
+                        path: rel,
+                        line: line_num,
+                        column: col,
+                        line_text,
+                        context_before,
+                        context_after,
+                    });
 
-                let mut context_before = Vec::new();
-                let mut context_after = Vec::new();
-
-                for (i, ctx_line) in lines[start..end].iter().enumerate() {
-                    let real_idx = start + i;
-                    if real_idx < idx {
-                        context_before.push(ctx_line.clone());
-                    } else if real_idx > idx {
-                        context_after.push(ctx_line.clone());
+                    if guard.len() as u32 >= max_results {
+                        hit_limit.store(true, Ordering::Relaxed);
+                        return ignore::WalkState::Quit;
                     }
                 }
 
-                let rel = match path.strip_prefix(&self.root) {
-                    Ok(r) => r.to_string_lossy().into_owned(),
-                    Err(_) => path.display().to_string(),
-                };
+                ignore::WalkState::Continue
+            })
+        });
 
-                hits.push(SearchHit {
-                    path: rel,
-                    line: line_num,
-                    column: col,
-                    line_text: line.clone(),
-                    context_before,
-                    context_after,
-                });
-
-                if hits.len() as u32 >= max_results {
-                    return Ok(SearchTextResult {
-                        hits,
-                        has_more: true,
-                    });
-                }
-            }
-        }
+        let hits = {
+            let mut guard = hits
+                .lock()
+                .expect("search_text: hits mutex poisoned at final collection");
+            std::mem::take(&mut *guard)
+        };
 
         Ok(SearchTextResult {
             hits,
-            has_more: false,
+            has_more: hit_limit.load(Ordering::Relaxed),
         })
     }
 

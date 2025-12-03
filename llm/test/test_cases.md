@@ -32,7 +32,7 @@ is the current project directory.
   - `entries` contains at least:
     - `Cargo.toml`
     - `src/backend.rs`
-    - `rmcp-sdk/Cargo.toml`
+    - `llm/test/test_cases.md`
   - All `path` values are **relative to the server root** (project directory), e.g. `src/backend.rs`.
   - `is_dir` is `false` for files.
   - `has_more` is `true` when more than 50 files exist.
@@ -368,17 +368,17 @@ is the current project directory.
 - Args:
   ```json
   {
-    "query": "serve_server",
+    "query": "LocalGitAwareFs",
     "mode": "literal",
     "case_sensitive": false,
-    "root": "rmcp-sdk",
+    "root": "src",
     "include_globs": ["**/*.rs"],
     "max_results": 5,
     "context_lines": 1
   }
   ```
 - Expectations:
-  - At least one hit in `rmcp-sdk/crates/rmcp/src/service/server.rs`.
+  - At least one hit in `src/backend.rs`.
   - Each hit has:
     - `path`, `line`, `column`, `line_text`,
     - `context_before` / `context_after` with 0–1 lines each.
@@ -466,10 +466,10 @@ is the current project directory.
 - Step 1 Args:
   ```json
   {
-    "query": "serve_server",
+    "query": "LocalGitAwareFs",
     "mode": "literal",
     "case_sensitive": false,
-    "root": "rmcp-sdk",
+    "root": "src",
     "include_globs": ["**/*.rs"],
     "max_results": 5,
     "context_lines": 1,
@@ -479,10 +479,10 @@ is the current project directory.
 - Step 2 Args:
   ```json
   {
-    "query": "serve_server",
+    "query": "LocalGitAwareFs",
     "mode": "literal",
     "case_sensitive": false,
-    "root": "rmcp-sdk",
+    "root": "src",
     "include_globs": ["**/*.rs"],
     "max_results": 5,
     "context_lines": 1,
@@ -513,7 +513,7 @@ is the current project directory.
 - Expectations:
   - Tool call succeeds.
   - `hits` (if any) only come from files under `D:/RDM`.
-  - `path` values in hits are relative to `D:/RDM` when possible (e.g. `subdir/file.txt`).
+  - `path` values in hits all point to files under `D:/RDM` (either as relative paths under that directory or as absolute paths within it, depending on how the server root is configured).
 
 ---
 
@@ -521,13 +521,14 @@ is the current project directory.
 
 ### 4.1 End-to-end navigation
 
-1. Use `list_files` to find a Rust file under `rmcp-sdk/crates/rmcp/src`.
+1. Use `list_files` to find a Rust file under `src` (for example `src/backend.rs`).
 2. Use `read_file` (lines mode) to read its first 60 lines.
-3. Use `search_text` constrained to that file path to find a specific symbol.
+3. Use `search_text` constrained to that file path (e.g. via `include_globs` using the same `path` returned by `list_files`) to find a specific symbol, such as `\"LocalGitAwareFs\"`.
 
 Expectations:
 - All three tools compose cleanly:
-  - Paths from `list_files` are valid inputs to `read_file` and `search_text`.
+  - Paths from `list_files` are valid inputs to `read_file` (via `path`) and to `search_text` (via `include_globs`).
+- No unexpected errors when chaining operations.
 
 ---
 
@@ -556,7 +557,7 @@ Expectations:
 - Args:
   ```json
   {
-    "query": "crates/rmcp/src",
+    "query": "src/backend.rs",
     "root": ".",
     "recursive": true,
     "match_mode": "path",
@@ -565,7 +566,7 @@ Expectations:
   ```
 - Expectations:
   - All returned `path` values are relative to the project root.
-  - At least one match is under `rmcp-sdk/crates/rmcp/src`.
+  - At least one match has `path` equal to `src/backend.rs`.
 
 ### 5.3 Case-insensitive name search
 
@@ -670,4 +671,3 @@ Expectations:
 - Expectations:
   - Tool call fails with an MCP error.
   - Error message indicates that the root is not inside a git repository.
-- No unexpected errors when chaining operations.
