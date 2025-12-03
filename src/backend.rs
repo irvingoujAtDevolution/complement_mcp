@@ -269,7 +269,9 @@ impl LocalGitAwareFs {
 
         let recursive = args.recursive.unwrap_or(true);
         let include_dirs = args.include_dirs.unwrap_or(true);
-        let max_results = args.max_results.unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
+        let max_results = args
+            .max_results
+            .unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
         let skip = args.skip.unwrap_or(0);
         let match_mode = args.match_mode.unwrap_or(FindMatchMode::Name);
         let case_sensitive = args.case_sensitive.unwrap_or(false);
@@ -294,8 +296,41 @@ impl LocalGitAwareFs {
             ));
         }
 
-        let include_globs = Self::build_globset(&args.include_globs)?;
-        let exclude_globs = Self::build_globset(&args.exclude_globs)?;
+        let include_globs = Self::build_globset(&args.include_globs)?
+            .map(Arc::new);
+        let exclude_globs = Self::build_globset(&args.exclude_globs)?
+            .map(Arc::new);
+
+        // How many matches we need to collect in total (for paging).
+        let total_needed = skip.saturating_add(max_results);
+
+        if total_needed == 0 {
+            return Ok(FindFilesResult {
+                matches: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        // Shared collection of matches; accessed from multiple threads.
+        let matches: Arc<Mutex<Vec<FindFileMatch>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        // Global counters across all threads: how many matches have been
+        // seen (for `skip`) and whether we hit the `total_needed` cap.
+        let seen_matches = Arc::new(AtomicU32::new(0));
+        let hit_limit = Arc::new(AtomicBool::new(false));
+
+        let repo_root = self.root.clone();
+
+        // Use a regex matcher for literal substring search, to avoid
+        // allocating a lowercased string per entry in the hot loop.
+        let query = args.query;
+        let escaped = regex::escape(&query);
+        let matcher = regex::RegexBuilder::new(&escaped)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .with_context(|| format!("invalid find_files query: {}", query))?;
+        let matcher = Arc::new(matcher);
 
         let mut builder = WalkBuilder::new(&start_path);
         builder.standard_filters(true);
@@ -303,98 +338,128 @@ impl LocalGitAwareFs {
             builder.max_depth(Some(1));
         }
 
-        let mut matches = Vec::new();
-        let mut seen_matches: u32 = 0;
+        builder.build_parallel().run(|| {
+            let matches = matches.clone();
+            let seen_matches = seen_matches.clone();
+            let hit_limit = hit_limit.clone();
+            let include_globs = include_globs.clone();
+            let exclude_globs = exclude_globs.clone();
+            let start_path = start_path.clone();
+            let repo_root = repo_root.clone();
+            let matcher = matcher.clone();
 
-        let query = args.query;
-        let query_lower = if case_sensitive {
-            None
-        } else {
-            Some(query.to_lowercase())
+            Box::new(move |entry_res| {
+                if hit_limit.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
+                }
+
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(err) => {
+                        eprintln!("find_files: skip entry error: {err}");
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                let path = entry.path();
+                if path == start_path {
+                    return ignore::WalkState::Continue;
+                }
+
+                let is_dir =
+                    entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir && !include_dirs {
+                    return ignore::WalkState::Continue;
+                }
+
+                let rel = match path.strip_prefix(&start_path) {
+                    Ok(r) => r,
+                    Err(_) => path.strip_prefix(&repo_root).unwrap_or(path),
+                };
+
+                let rel_str = rel.to_string_lossy();
+
+                if let Some(ref excludes) = exclude_globs
+                    && excludes.is_match(rel_str.as_ref())
+                {
+                    return ignore::WalkState::Continue;
+                }
+
+                if let Some(ref includes) = include_globs
+                    && !includes.is_match(rel_str.as_ref())
+                {
+                    return ignore::WalkState::Continue;
+                }
+
+                let haystack = match match_mode {
+                    FindMatchMode::Name => {
+                        match path.file_name().and_then(|n| n.to_str()) {
+                            Some(name) => name,
+                            None => return ignore::WalkState::Continue,
+                        }
+                    }
+                    FindMatchMode::Path => rel_str.as_ref(),
+                };
+
+                if !matcher.is_match(haystack) {
+                    return ignore::WalkState::Continue;
+                }
+
+                let seen_after =
+                    seen_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                if seen_after > total_needed {
+                    hit_limit.store(true, Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
+                }
+
+                let rel_owned = rel_str.into_owned();
+
+                let mut guard = matches
+                    .lock()
+                    .expect("find_files: matches mutex poisoned");
+                guard.push(FindFileMatch {
+                    path: rel_owned,
+                    is_dir,
+                });
+
+                ignore::WalkState::Continue
+            })
+        });
+
+        let mut matches = {
+            let mut guard = matches
+                .lock()
+                .expect(
+                    "find_files: matches mutex poisoned at final collection",
+                );
+            std::mem::take(&mut *guard)
         };
 
-        for result in builder.build() {
-            let entry = match result {
-                Ok(e) => e,
-                Err(err) => {
-                    eprintln!("find_files: skip entry error: {err}");
-                    continue;
-                }
-            };
+        // Parallel walking does not guarantee order; sort by path to make
+        // results deterministic before applying skip/limit.
+        matches.sort_by(|a, b| a.path.cmp(&b.path));
 
-            let path = entry.path();
-            if path == start_path {
-                continue;
-            }
+        let skip_usize = skip as usize;
+        let max_usize = max_results as usize;
+        let total = matches.len();
 
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir && !include_dirs {
-                continue;
-            }
+        let sliced = if skip_usize >= total {
+            Vec::new()
+        } else {
+            matches
+                .into_iter()
+                .skip(skip_usize)
+                .take(max_usize)
+                .collect()
+        };
 
-            let rel = match path.strip_prefix(&start_path) {
-                Ok(r) => r,
-                Err(_) => path.strip_prefix(&self.root).unwrap_or(path),
-            };
-
-            let rel_str = rel.to_string_lossy();
-
-            if let Some(ref excludes) = exclude_globs
-                && excludes.is_match(rel_str.as_ref())
-            {
-                continue;
-            }
-
-            if let Some(ref includes) = include_globs
-                && !includes.is_match(rel_str.as_ref())
-            {
-                continue;
-            }
-
-            // Decide what to match against: name or path.
-            let target = match match_mode {
-                FindMatchMode::Name => match path.file_name().and_then(|n| n.to_str()) {
-                    Some(name) => name,
-                    None => continue,
-                },
-                FindMatchMode::Path => rel_str.as_ref(),
-            };
-
-            let is_match = if case_sensitive {
-                target.contains(&query)
-            } else {
-                let needle = query_lower
-                    .as_ref()
-                    .expect("lowercased query should be available");
-                let hay_lower = target.to_lowercase();
-                hay_lower.contains(needle)
-            };
-
-            if !is_match {
-                continue;
-            }
-
-            seen_matches = seen_matches.saturating_add(1);
-            if seen_matches <= skip {
-                continue;
-            }
-
-            matches.push(FindFileMatch {
-                path: rel_str.into_owned(),
-                is_dir,
-            });
-
-            if matches.len() as u32 >= max_results {
-                return Ok(FindFilesResult {
-                    matches,
-                    has_more: true,
-                });
-            }
-        }
+        let has_more = hit_limit.load(Ordering::Relaxed)
+            || (seen_matches.load(Ordering::Relaxed)
+                > total_needed);
 
         Ok(FindFilesResult {
-            matches,
-            has_more: false,
+            matches: sliced,
+            has_more,
         })
     }
 
