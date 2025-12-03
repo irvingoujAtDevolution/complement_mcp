@@ -1,4 +1,5 @@
 mod backend;
+mod error;
 mod mcp_service;
 mod types;
 

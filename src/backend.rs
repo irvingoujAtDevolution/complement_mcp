@@ -1,20 +1,20 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
-use anyhow::{Context, Result, anyhow};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use memmap2::Mmap;
 use regex::bytes::RegexBuilder as ByteRegexBuilder;
 
+use crate::error::{FsError, Result};
 use crate::types::{
     FileChunkResult, FileEntry, FileRangeInfo, FindFileMatch, FindFilesArgs, FindFilesResult,
-    FindMatchMode, ListFilesArgs, ListFilesResult, RangeType, ReadFileArgs, SearchHit,
-    SearchMode, SearchTextArgs, SearchTextResult,
+    FindMatchMode, ListFilesArgs, ListFilesResult, RangeType, ReadFileArgs, SearchHit, SearchMode,
+    SearchTextArgs, SearchTextResult,
 };
 
 const DEFAULT_MAX_SEARCH_RESULTS: u32 = 200;
@@ -37,13 +37,13 @@ impl LocalGitAwareFs {
         };
         let root = root
             .canonicalize()
-            .context("failed to canonicalize root directory")?;
+            .map_err(|source| FsError::CanonicalizeRoot {
+                root: root.clone(),
+                source,
+            })?;
 
         if !root.is_dir() {
-            return Err(anyhow!(
-                "root directory is not a directory: {}",
-                root.display()
-            ));
+            return Err(FsError::RootNotDirectory { path: root });
         }
 
         Ok(Self { root })
@@ -61,13 +61,13 @@ impl LocalGitAwareFs {
 
         let canonical = joined
             .canonicalize()
-            .with_context(|| format!("failed to canonicalize path: {}", joined.display()))?;
+            .map_err(|source| FsError::CanonicalizePath {
+                path: joined.clone(),
+                source,
+            })?;
 
         if !is_absolute && !canonical.starts_with(&self.root) {
-            return Err(anyhow!(
-                "path escapes repository root: {}",
-                canonical.display()
-            ));
+            return Err(FsError::PathEscapesRepo { path: canonical });
         }
 
         Ok(canonical)
@@ -79,15 +79,23 @@ impl LocalGitAwareFs {
 
         if let Some(pats) = patterns {
             for pat in pats {
-                let glob =
-                    Glob::new(pat).with_context(|| format!("invalid glob pattern: {pat}"))?;
+                let glob = Glob::new(pat).map_err(|source| FsError::InvalidGlobPattern {
+                    pattern: pat.clone(),
+                    source,
+                })?;
                 builder.add(glob);
                 any = true;
             }
         }
 
         if any {
-            Ok(Some(builder.build()?))
+            let built = builder
+                .build()
+                .map_err(|source| FsError::InvalidGlobPattern {
+                    pattern: "<compiled globset>".to_string(),
+                    source,
+                })?;
+            Ok(Some(built))
         } else {
             Ok(None)
         }
@@ -113,18 +121,21 @@ impl LocalGitAwareFs {
         let start_path = if is_absolute {
             root_path
                 .canonicalize()
-                .with_context(|| format!("failed to canonicalize list_files root: {}", root_arg))?
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: root_path.to_path_buf(),
+                    source,
+                })?
         } else {
             let joined = self.root.join(root_path);
             let canonical = joined
                 .canonicalize()
-                .with_context(|| format!("failed to canonicalize list_files root: {}", joined.display()))?;
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: joined.clone(),
+                    source,
+                })?;
 
             if !canonical.starts_with(&self.root) {
-                return Err(anyhow!(
-                    "list_files root escapes repository root: {}",
-                    canonical.display()
-                ));
+                return Err(FsError::PathEscapesRepo { path: canonical });
             }
 
             canonical
@@ -137,27 +148,24 @@ impl LocalGitAwareFs {
         let include_metadata = args.include_metadata.unwrap_or(false);
 
         if !start_path.exists() {
-            return Err(anyhow!(
-                "list_files root path does not exist: {}",
-                start_path.display()
-            ));
+            return Err(FsError::ListRootNotExist {
+                path: start_path.clone(),
+            });
         }
         if !start_path.is_dir() {
-            return Err(anyhow!(
-                "list_files root path is not a directory: {}",
-                start_path.display()
-            ));
+            return Err(FsError::ListRootNotDirectory {
+                path: start_path.clone(),
+            });
         }
 
         if is_absolute && Self::find_git_root(&start_path).is_none() {
-            return Err(anyhow!(
-                "list_files root path is not inside a git repository: {}",
-                start_path.display()
-            ));
+            return Err(FsError::ListRootNotInGit {
+                path: start_path.clone(),
+            });
         }
 
-        let include_globs = Self::build_globset(&args.include_globs)?;
-        let exclude_globs = Self::build_globset(&args.exclude_globs)?;
+        let include_globs: Option<GlobSet> = Self::build_globset(&args.include_globs)?;
+        let exclude_globs: Option<GlobSet> = Self::build_globset(&args.exclude_globs)?;
 
         let mut builder = WalkBuilder::new(&start_path);
         builder.standard_filters(true);
@@ -250,18 +258,21 @@ impl LocalGitAwareFs {
         let start_path = if is_absolute {
             root_path
                 .canonicalize()
-                .with_context(|| format!("failed to canonicalize find_files root: {}", root_arg))?
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: root_path.to_path_buf(),
+                    source,
+                })?
         } else {
             let joined = self.root.join(root_path);
             let canonical = joined
                 .canonicalize()
-                .with_context(|| format!("failed to canonicalize find_files root: {}", joined.display()))?;
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: joined.clone(),
+                    source,
+                })?;
 
             if !canonical.starts_with(&self.root) {
-                return Err(anyhow!(
-                    "find_files root escapes repository root: {}",
-                    canonical.display()
-                ));
+                return Err(FsError::PathEscapesRepo { path: canonical });
             }
 
             canonical
@@ -269,37 +280,30 @@ impl LocalGitAwareFs {
 
         let recursive = args.recursive.unwrap_or(true);
         let include_dirs = args.include_dirs.unwrap_or(true);
-        let max_results = args
-            .max_results
-            .unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
+        let max_results = args.max_results.unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
         let skip = args.skip.unwrap_or(0);
         let match_mode = args.match_mode.unwrap_or(FindMatchMode::Name);
         let case_sensitive = args.case_sensitive.unwrap_or(false);
 
         if !start_path.exists() {
-            return Err(anyhow!(
-                "find_files root path does not exist: {}",
-                start_path.display()
-            ));
+            return Err(FsError::FindRootNotExist {
+                path: start_path.clone(),
+            });
         }
         if !start_path.is_dir() {
-            return Err(anyhow!(
-                "find_files root path is not a directory: {}",
-                start_path.display()
-            ));
+            return Err(FsError::FindRootNotDirectory {
+                path: start_path.clone(),
+            });
         }
 
         if is_absolute && Self::find_git_root(&start_path).is_none() {
-            return Err(anyhow!(
-                "find_files root path is not inside a git repository: {}",
-                start_path.display()
-            ));
+            return Err(FsError::FindRootNotInGit {
+                path: start_path.clone(),
+            });
         }
 
-        let include_globs = Self::build_globset(&args.include_globs)?
-            .map(Arc::new);
-        let exclude_globs = Self::build_globset(&args.exclude_globs)?
-            .map(Arc::new);
+        let include_globs: Option<GlobSet> = Self::build_globset(&args.include_globs)?;
+        let exclude_globs: Option<GlobSet> = Self::build_globset(&args.exclude_globs)?;
 
         // How many matches we need to collect in total (for paging).
         let total_needed = skip.saturating_add(max_results);
@@ -312,8 +316,7 @@ impl LocalGitAwareFs {
         }
 
         // Shared collection of matches; accessed from multiple threads.
-        let matches: Arc<Mutex<Vec<FindFileMatch>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let matches: Arc<Mutex<Vec<FindFileMatch>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Global counters across all threads: how many matches have been
         // seen (for `skip`) and whether we hit the `total_needed` cap.
@@ -329,7 +332,10 @@ impl LocalGitAwareFs {
         let matcher = regex::RegexBuilder::new(&escaped)
             .case_insensitive(!case_sensitive)
             .build()
-            .with_context(|| format!("invalid find_files query: {}", query))?;
+            .map_err(|source| FsError::InvalidFindFilesRegex {
+                query: query.clone(),
+                source,
+            })?;
         let matcher = Arc::new(matcher);
 
         let mut builder = WalkBuilder::new(&start_path);
@@ -366,8 +372,7 @@ impl LocalGitAwareFs {
                     return ignore::WalkState::Continue;
                 }
 
-                let is_dir =
-                    entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir && !include_dirs {
                     return ignore::WalkState::Continue;
                 }
@@ -392,12 +397,10 @@ impl LocalGitAwareFs {
                 }
 
                 let haystack = match match_mode {
-                    FindMatchMode::Name => {
-                        match path.file_name().and_then(|n| n.to_str()) {
-                            Some(name) => name,
-                            None => return ignore::WalkState::Continue,
-                        }
-                    }
+                    FindMatchMode::Name => match path.file_name().and_then(|n| n.to_str()) {
+                        Some(name) => name,
+                        None => return ignore::WalkState::Continue,
+                    },
                     FindMatchMode::Path => rel_str.as_ref(),
                 };
 
@@ -405,8 +408,7 @@ impl LocalGitAwareFs {
                     return ignore::WalkState::Continue;
                 }
 
-                let seen_after =
-                    seen_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                let seen_after = seen_matches.fetch_add(1, Ordering::Relaxed) + 1;
                 if seen_after > total_needed {
                     hit_limit.store(true, Ordering::Relaxed);
                     return ignore::WalkState::Quit;
@@ -414,9 +416,7 @@ impl LocalGitAwareFs {
 
                 let rel_owned = rel_str.into_owned();
 
-                let mut guard = matches
-                    .lock()
-                    .expect("find_files: matches mutex poisoned");
+                let mut guard = matches.lock().expect("find_files: matches mutex poisoned");
                 guard.push(FindFileMatch {
                     path: rel_owned,
                     is_dir,
@@ -429,9 +429,7 @@ impl LocalGitAwareFs {
         let mut matches = {
             let mut guard = matches
                 .lock()
-                .expect(
-                    "find_files: matches mutex poisoned at final collection",
-                );
+                .expect("find_files: matches mutex poisoned at final collection");
             std::mem::take(&mut *guard)
         };
 
@@ -454,8 +452,7 @@ impl LocalGitAwareFs {
         };
 
         let has_more = hit_limit.load(Ordering::Relaxed)
-            || (seen_matches.load(Ordering::Relaxed)
-                > total_needed);
+            || (seen_matches.load(Ordering::Relaxed) > total_needed);
 
         Ok(FindFilesResult {
             matches: sliced,
@@ -476,14 +473,10 @@ impl LocalGitAwareFs {
 
         match range_type {
             RangeType::Bytes if has_line_params => {
-                return Err(anyhow!(
-                    "invalid read_file arguments: start_line/max_lines cannot be used with bytes range_type"
-                ));
+                return Err(FsError::ReadFileLinesWithBytes);
             }
             RangeType::Lines if has_byte_params => {
-                return Err(anyhow!(
-                    "invalid read_file arguments: offset_bytes/max_bytes cannot be used with lines range_type"
-                ));
+                return Err(FsError::ReadFileBytesWithLines);
             }
             _ => {}
         }
@@ -498,29 +491,36 @@ impl LocalGitAwareFs {
         let offset = args.offset_bytes.unwrap_or(0);
         let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
 
-        let mut file = File::open(abs_path)
-            .with_context(|| format!("failed to open file: {}", abs_path.display()))?;
+        let mut file = File::open(abs_path).map_err(|source| FsError::OpenFile {
+            path: abs_path.to_path_buf(),
+            source,
+        })?;
 
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
-                .with_context(|| format!("failed to seek in file: {}", abs_path.display()))?;
+                .map_err(|source| FsError::SeekFile {
+                    path: abs_path.to_path_buf(),
+                    source,
+                })?;
         }
 
         let mut buf = Vec::new();
         let mut limited = file.take(max_bytes);
         limited
             .read_to_end(&mut buf)
-            .with_context(|| format!("failed to read file: {}", abs_path.display()))?;
+            .map_err(|source| FsError::ReadFile {
+                path: abs_path.to_path_buf(),
+                source,
+            })?;
 
-        let content = String::from_utf8(buf.clone()).map_err(|_| {
-            anyhow!(
-                "file is not valid UTF-8, binary files are not supported: {}",
-                abs_path.display()
-            )
+        let content = String::from_utf8(buf.clone()).map_err(|_| FsError::FileNotUtf8 {
+            path: abs_path.to_path_buf(),
         })?;
 
-        let metadata = std::fs::metadata(abs_path)
-            .with_context(|| format!("failed to get metadata: {}", abs_path.display()))?;
+        let metadata = std::fs::metadata(abs_path).map_err(|source| FsError::FileMetadata {
+            path: abs_path.to_path_buf(),
+            source,
+        })?;
         let file_len = metadata.len();
         let is_truncated = offset + max_bytes < file_len;
 
@@ -545,11 +545,13 @@ impl LocalGitAwareFs {
         let max_lines = args.max_lines.unwrap_or(DEFAULT_MAX_READ_LINES);
 
         if start_line == 0 {
-            return Err(anyhow!("start_line must be >= 1"));
+            return Err(FsError::StartLineMustBePositive);
         }
 
-        let file = File::open(abs_path)
-            .with_context(|| format!("failed to open file: {}", abs_path.display()))?;
+        let file = File::open(abs_path).map_err(|source| FsError::OpenFile {
+            path: abs_path.to_path_buf(),
+            source,
+        })?;
         let reader = BufReader::new(file);
 
         let mut content = String::new();
@@ -558,8 +560,10 @@ impl LocalGitAwareFs {
         let mut is_truncated = false;
 
         for line_res in reader.lines() {
-            let line = line_res
-                .with_context(|| format!("failed to read line from {}", abs_path.display()))?;
+            let line = line_res.map_err(|source| FsError::ReadLine {
+                path: abs_path.to_path_buf(),
+                source,
+            })?;
             current_line += 1;
 
             if current_line < start_line {
@@ -604,15 +608,16 @@ impl LocalGitAwareFs {
         let is_absolute = root_path.is_absolute();
 
         let start_path = if is_absolute {
-            let canonical = root_path
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize search_text root: {}", root_arg))?;
+            let canonical =
+                root_path
+                    .canonicalize()
+                    .map_err(|source| FsError::CanonicalizePath {
+                        path: root_path.to_path_buf(),
+                        source,
+                    })?;
 
             if Self::find_git_root(&canonical).is_none() {
-                return Err(anyhow!(
-                    "search_text root path is not inside a git repository: {}",
-                    canonical.display()
-                ));
+                return Err(FsError::SearchRootNotInGit { path: canonical });
             }
 
             canonical
@@ -620,27 +625,20 @@ impl LocalGitAwareFs {
             let joined = self.root.join(root_path);
             let canonical = joined
                 .canonicalize()
-                .with_context(|| {
-                    format!(
-                        "failed to canonicalize search_text root: {}",
-                        joined.display()
-                    )
+                .map_err(|source| FsError::CanonicalizePath {
+                    path: joined.clone(),
+                    source,
                 })?;
 
             if !canonical.starts_with(&self.root) {
-                return Err(anyhow!(
-                    "search_text root escapes repository root: {}",
-                    canonical.display()
-                ));
+                return Err(FsError::SearchRootEscapesRepo { path: canonical });
             }
 
             canonical
         };
 
-        let include_globs = Self::build_globset(&args.include_globs)?
-            .map(Arc::new);
-        let exclude_globs = Self::build_globset(&args.exclude_globs)?
-            .map(Arc::new);
+        let include_globs = Self::build_globset(&args.include_globs)?.map(Arc::new);
+        let exclude_globs = Self::build_globset(&args.exclude_globs)?.map(Arc::new);
 
         // Build a bytes-based regex matcher. Literal mode is implemented
         // by escaping the query string.
@@ -652,11 +650,13 @@ impl LocalGitAwareFs {
         let matcher = ByteRegexBuilder::new(&pattern_str)
             .case_insensitive(!case_sensitive)
             .build()
-            .with_context(|| format!("invalid regex: {}", args.query))?;
+            .map_err(|source| FsError::InvalidSearchRegex {
+                query: args.query.clone(),
+                source,
+            })?;
 
         let matcher = Arc::new(matcher);
-        let hits: Arc<Mutex<Vec<SearchHit>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let hits: Arc<Mutex<Vec<SearchHit>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Global counters across all threads: how many matches have been
         // seen (for `skip`) and whether we hit the `max_results` cap.
@@ -728,10 +728,7 @@ impl LocalGitAwareFs {
                 let mmap = match unsafe { Mmap::map(&file) } {
                     Ok(m) => m,
                     Err(err) => {
-                        eprintln!(
-                            "search_text: skip mmap error {}: {err}",
-                            path.display()
-                        );
+                        eprintln!("search_text: skip mmap error {}: {err}", path.display());
                         return ignore::WalkState::Continue;
                     }
                 };
@@ -777,8 +774,7 @@ impl LocalGitAwareFs {
 
                     let col_idx = mat.start();
 
-                    let seen_before =
-                        seen_matches.fetch_add(1, Ordering::Relaxed);
+                    let seen_before = seen_matches.fetch_add(1, Ordering::Relaxed);
                     let seen_after = seen_before + 1;
 
                     if seen_after <= skip {
@@ -786,9 +782,7 @@ impl LocalGitAwareFs {
                     }
 
                     // Check and push into the shared hits vector.
-                    let mut guard = hits
-                        .lock()
-                        .expect("search_text: hits mutex poisoned");
+                    let mut guard = hits.lock().expect("search_text: hits mutex poisoned");
                     if guard.len() as u32 >= max_results {
                         hit_limit.store(true, Ordering::Relaxed);
                         return ignore::WalkState::Quit;
@@ -797,12 +791,8 @@ impl LocalGitAwareFs {
                     let line_num = idx as u64 + 1;
                     let col = col_idx as u64;
 
-                    let start_ctx =
-                        idx.saturating_sub(context_lines as usize);
-                    let end_ctx = usize::min(
-                        line_count,
-                        idx + 1 + context_lines as usize,
-                    );
+                    let start_ctx = idx.saturating_sub(context_lines as usize);
+                    let end_ctx = usize::min(line_count, idx + 1 + context_lines as usize);
 
                     let mut context_before = Vec::new();
                     let mut context_after = Vec::new();
@@ -824,8 +814,7 @@ impl LocalGitAwareFs {
                         }
 
                         let ctx_slice = &mmap[ctx_start..ctx_end];
-                        let ctx_text =
-                            String::from_utf8_lossy(ctx_slice).to_string();
+                        let ctx_text = String::from_utf8_lossy(ctx_slice).to_string();
 
                         if ctx_idx < idx {
                             context_before.push(ctx_text);
@@ -839,8 +828,7 @@ impl LocalGitAwareFs {
                         Err(_) => path.display().to_string(),
                     };
 
-                    let line_text =
-                        String::from_utf8_lossy(line_slice).to_string();
+                    let line_text = String::from_utf8_lossy(line_slice).to_string();
 
                     guard.push(SearchHit {
                         path: rel,
