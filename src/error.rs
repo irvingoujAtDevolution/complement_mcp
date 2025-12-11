@@ -48,6 +48,15 @@ pub enum FsError {
     #[error("search_text root escapes repository root: {path}")]
     SearchRootEscapesRepo { path: PathBuf },
 
+    #[error("read_file path does not exist: {path}")]
+    ReadFilePathNotExist { path: PathBuf },
+
+    #[error("read_file permission denied for path: {path}")]
+    ReadFilePermissionDenied { path: PathBuf },
+
+    #[error("read_file target is not a regular file: {path}")]
+    ReadFileNotFile { path: PathBuf },
+
     #[error("write path is not inside a git repository: {path}")]
     WritePathNotInGit { path: PathBuf },
 

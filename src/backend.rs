@@ -61,12 +61,23 @@ impl LocalGitAwareFs {
             self.root.join(rel_path)
         };
 
-        let canonical = joined
-            .canonicalize()
-            .map_err(|source| FsError::CanonicalizePath {
-                path: joined.clone(),
-                source,
-            })?;
+        let canonical = match joined.canonicalize() {
+            Ok(p) => p,
+            Err(source) => {
+                return Err(match source.kind() {
+                    io::ErrorKind::NotFound => FsError::ReadFilePathNotExist {
+                        path: joined.clone(),
+                    },
+                    io::ErrorKind::PermissionDenied => FsError::ReadFilePermissionDenied {
+                        path: joined.clone(),
+                    },
+                    _ => FsError::CanonicalizePath {
+                        path: joined.clone(),
+                        source,
+                    },
+                });
+            }
+        };
 
         if !is_absolute && !canonical.starts_with(&self.root) {
             return Err(FsError::PathEscapesRepo { path: canonical });
@@ -1109,6 +1120,15 @@ impl LocalGitAwareFs {
 
     pub fn read_file(&self, args: ReadFileArgs) -> Result<FileChunkResult> {
         let abs_path = self.resolve_path(&args.path)?;
+        let meta = std::fs::metadata(&abs_path).map_err(|source| FsError::FileMetadata {
+            path: abs_path.to_path_buf(),
+            source,
+        })?;
+        if !meta.is_file() {
+            return Err(FsError::ReadFileNotFile {
+                path: abs_path.to_path_buf(),
+            });
+        }
         let has_byte_params = args.offset_bytes.is_some() || args.max_bytes.is_some();
         let has_line_params = args.start_line.is_some() || args.max_lines.is_some();
 
